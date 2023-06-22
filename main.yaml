@@ -1,0 +1,210 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: This template is a solution for continuous integration and continuous deployment of MSI CICD Software Update pipeline solution.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Application Name for our CodeDeploy
+    Default: MSI-Application
+
+  DeployWindowsImage:
+    Type: String
+    Default: aws/codebuild/windows-base:2019-2.0
+    Description: Windows image to use for the deployment phase.
+
+  SourceObjectKey:
+    Description: S3 source artifact that pipeline will look for. 
+    Type: String
+    Default: software-MSI.zip
+
+Resources:
+
+  # CodeDeploy Application
+  MSISoftwareApplication: 
+    Type: AWS::CodeDeploy::Application 
+    Properties:
+      ComputePlatform: Server
+
+  # Bucket for the appspec.yml file with your MSI updated software in .zip format
+  MSISoftwareBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: 
+        Status: Enabled
+
+  # Artifacts produced by the pipeline
+  MSIArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+
+# Bucket policy for the Artifact which will be produced by the pipeline
+  MSIArtifactStoreBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MSIArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Join [ '', [ !GetAtt MSIArtifactStoreBucket.Arn, '/*' ] ]
+            Condition:
+              StringNotEquals: 
+                s3:x-amz-server-side-encryption: aws:kms
+          -
+            Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: !Join [ '', [ !GetAtt MSIArtifactStoreBucket.Arn, '/*' ] ]
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+# Codedeploy service role 
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+              - codedeploy.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole" ]
+
+
+# Service role to give permissions to Codepipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+
+      Policies:
+        -
+          PolicyName: AWS-CodePipeline-Service-
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+
+              -
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                  - ec2:*
+                  - s3:*
+                Resource: '*'
+
+#  ------------------------------------------------------------------------------------------------
+# Deployment Groups for each EC2 instances and stage
+  StagingDeployGroup:
+      Type: AWS::CodeDeploy::DeploymentGroup
+      Properties:
+        ApplicationName: !Ref MSISoftwareApplication
+        Ec2TagFilters:
+          - Key: Environment
+            Value: Staging
+            Type: KEY_AND_VALUE
+        ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+
+  ProductionDeployGroup:
+      Type: AWS::CodeDeploy::DeploymentGroup
+      Properties:
+        ApplicationName: !Ref MSISoftwareApplication
+        Ec2TagFilters:
+          - Key: Environment
+            Value: Production
+            Type: KEY_AND_VALUE
+        ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+
+# CICD Pipeline steps
+  MSIPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      Name: MSI-Update-Pipeline
+      RoleArn:
+        !GetAtt CodePipelineServiceRole.Arn
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              OutputArtifacts:
+                - Name: !Ref MSIArtifactStoreBucket
+              Configuration:
+                S3Bucket: !Ref MSISoftwareBucket
+                S3ObjectKey: !Ref SourceObjectKey
+                PollForSourceChanges: true
+              RunOrder: 1
+        -
+          Name: Staging
+          Actions:
+            - Name: Deploy
+              InputArtifacts:
+                - Name: !Ref MSIArtifactStoreBucket
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref MSISoftwareApplication
+                DeploymentGroupName: !Ref StagingDeployGroup
+              RunOrder: 1
+            - Name: UAT
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              RunOrder: 2
+        -
+          Name: Production
+          Actions:
+            -
+              Name: Deploy
+              InputArtifacts:
+                - Name: !Ref MSIArtifactStoreBucket
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref MSISoftwareApplication
+                DeploymentGroupName: !Ref ProductionDeployGroup
+              RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        Location: !Ref MSIArtifactStoreBucket
